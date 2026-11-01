@@ -1,0 +1,182 @@
+---
+title: "Segment Analysis Script"
+subtitle: "A guided walkthrough of `pipeline/segment_analysis.R`"
+author: "Navneet Kaur"
+date: "BDA400 — `r Sys.Date()`"
+output:
+  html_document:
+    theme: spacelab
+    highlight: zenburn
+    toc: true
+    toc_float:
+      collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  eval    = FALSE,
+  tidy    = FALSE,
+  comment = ""
+)
+```
+
+---
+
+## Declaration
+
+> **AI Assistance Declaration:** I used Claude (Anthropic) to suggest code block formatting, section headers, and general RMarkdown structure improvements. Prompts: "Here's my R script description. Suggest Markdown formatting and code block examples." and "Add syntax highlighting and improve section organization." I verified the document by knitting in RStudio and checking that all described function behaviour matches the actual code. All writing is my own. I am responsible for the accuracy and originality of this work.
+
+---
+
+## Overview
+
+`segment_analysis.R` answers the central question of this project: *which content categories and posting conditions are associated with higher engagement?*
+
+It receives a cleaned data frame from `compute_engagement.R` and produces three summary tables. No modelling, no statistics — just grouped aggregations and comparative summaries that non-technical stakeholders can interpret directly from the HTML report.
+
+Think of this script as the "so what?" layer. The previous scripts handled data quality and metric definition; this one handles interpretation of patterns.
+
+---
+
+## Input Contract
+
+This script expects a data frame called `engagement_df` with these columns already present:
+
+```r
+# Columns produced by compute_engagement.R
+# segment_analysis.R assumes these exist — it will not re-create them
+
+# engagement_rate = (likes + shares + comments) / impressions
+# hour_of_day     = lubridate::hour(published_at)
+# day_of_week     = lubridate::wday(published_at, label = TRUE)
+# week_number     = lubridate::week(published_at)
+```
+
+If you call `segment_analysis.R` directly without running `compute_engagement.R` first, you'll get an informative error:
+
+```r
+required <- c("engagement_rate", "hour_of_day", "day_of_week", "content_category")
+missing  <- setdiff(required, names(engagement_df))
+
+if (length(missing) > 0) {
+  stop(paste("Missing columns:", paste(missing, collapse = ", "),
+             "\nRun compute_engagement.R first."))
+}
+```
+
+---
+
+## What the Script Produces
+
+### Table 1 — Category Summary
+
+Groups posts by `content_category` and calculates summary engagement statistics:
+
+```r
+library(dplyr)
+
+category_summary <- engagement_df |>
+  group_by(content_category) |>
+  summarise(
+    n_posts         = n(),
+    mean_eng_rate   = mean(engagement_rate,  na.rm = TRUE),
+    median_eng_rate = median(engagement_rate, na.rm = TRUE),
+    total_likes     = sum(likes),
+    total_shares    = sum(shares),
+    pct_paid        = mean(is_paid) * 100,
+    .groups         = "drop"
+  ) |>
+  arrange(desc(mean_eng_rate))
+```
+
+**Why both mean and median?** Engagement distributions are right-skewed — a handful of viral posts inflate the mean. Presenting both gives a more honest picture. If `mean >> median` for a category, high engagement in that category is driven by outliers, not typical posts.
+
+---
+
+### Table 2 — Hourly Engagement Means
+
+```r
+hourly_means <- engagement_df |>
+  group_by(hour_of_day) |>
+  summarise(
+    mean_engagement = mean(engagement_rate, na.rm = TRUE),
+    n_posts         = n(),
+    .groups         = "drop"
+  )
+```
+
+This table feeds the bar chart in the report's "When to Post" section. Hours with very few posts (e.g., 3am–5am, `n_posts < 10`) are flagged for the report's narrative — averages from small samples are volatile and shouldn't drive posting decisions.
+
+```r
+# Flag low-sample hours for the report
+hourly_means <- hourly_means |>
+  mutate(low_sample_flag = n_posts < 10)
+```
+
+---
+
+### Table 3 — Day-of-Week × Category Crosstab
+
+The most complex output: a pivoted table showing mean engagement rate for each combination of posting day and content category.
+
+```r
+library(tidyr)
+
+dow_category_crosstab <- engagement_df |>
+  group_by(day_of_week, content_category) |>
+  summarise(mean_eng = mean(engagement_rate, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(
+    names_from  = content_category,
+    values_from = mean_eng
+  )
+```
+
+This table appears in the report as a formatted HTML table using `knitr::kable()` with conditional highlighting (top-3 cells per column shaded green).
+
+---
+
+## Handling Edge Cases
+
+Two edge cases were encountered while testing with the synthetic dataset:
+
+**Empty categories after filtering:**
+
+If any `content_category` has zero posts in a filtered subset (e.g., date-range filter in the Shiny version), `group_by() |> summarise()` drops that group silently. The `category_summary` table would have fewer rows than expected. A `.groups = "drop"` warning would appear. This is acceptable in the batch pipeline but could cause dashboard display issues if the category is expected to always appear. The Shiny version uses `complete()` to reintroduce missing groups with `NA` values.
+
+**Paid vs. organic mixing in hourly averages:**
+
+Paid posts have artificially inflated impressions, which suppresses their `engagement_rate`. Including them in `hourly_means` could make certain hours look less engaging than they are (if paid posts are concentrated in peak hours). The `run_all.R` pipeline computes `hourly_means` on organic posts only by default:
+
+```r
+# In run_all.R — passes only organic posts to segment_analysis.R
+segment_analysis(engagement_df |> dplyr::filter(!is_paid))
+```
+
+---
+
+## Outputs Written to Disk
+
+```r
+# Written by generate_report.R, not by this script directly
+# segment_analysis.R returns its tables as a named list
+
+list(
+  category   = category_summary,
+  hourly     = hourly_means,
+  crosstab   = dow_category_crosstab
+)
+```
+
+`generate_report.R` receives this list, passes it to the `.Rmd` template, and exports `data/processed/segment_summary.csv` as a side effect.
+
+---
+
+## Limitations
+
+- Engagement rate is a ratio metric and should not be compared across posts with very different impression counts. A post with 10 impressions and 1 like has a 10% engagement rate; a post with 10,000 impressions and 100 likes has a 1% rate. Both are valid observations but represent very different contexts.
+- This analysis makes no causal claims. Higher engagement on Tuesday afternoons could reflect content strategy, audience behaviour, platform algorithms, or coincidence in the synthetic data.
+
+---
+
+*Document prepared for BDA400 | Navneet Kaur | markdown-buddy-navneet*
